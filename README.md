@@ -29,9 +29,6 @@ python -m citation_matcher.train
 
 Модель сохраняется в `models/model.pkl`.
 
-## eLibrary.ru
-
-eLibrary требует cookies и часто блокирует запросы без прокси. Скопируйте `.env.example` в `.env` и задайте переменные прокси. Cookies сохраняются в `data/elibrary_cookies.json`.
 
 При captcha eLibrary пропускается, поиск продолжается по остальным базам.
 
