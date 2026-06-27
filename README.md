@@ -114,10 +114,6 @@ python scripts/compare_ranking.py                  # native vs ML по исто�
 python scripts/compare_sources.py --english 15 --russian 15
 ```
 
-## Документация
-
-[docs/DESIGN_DOCUMENT.md](docs/DESIGN_DOCUMENT.md) — дизайн-документ проекта.
-
 ## Ограничения
 
 - Качество зависит от полноты запроса и наличия статьи в базах.
