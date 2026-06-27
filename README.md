@@ -2,57 +2,55 @@
 
 Программный инструмент для исправления ошибок в библиографических описаниях (тема 8).
 
-Для заданного библиографического описания инструмент параллельно обращается к двум открытым наукометрическим базам — [Crossref](https://www.crossref.org/) и [OpenAlex](https://openalex.org/) — объединяет кандидатов, ранжирует их ML-моделью и возвращает наиболее вероятную статью с вероятностью совпадения и оформленной библиографической ссылкой.
+Для заданного библиографического описания инструмент обращается к открытым наукометрическим базам — [Crossref](https://www.crossref.org/), [OpenAlex](https://openalex.org/), [КиберЛенинка](https://cyberleninka.ru/) и [eLibrary.ru](https://elibrary.ru/) — находит кандидатов, ранжирует их ML-моделью и возвращает наиболее вероятную статью с **вероятностью совпадения** и оформленной библиографической ссылкой.
 
 ## Установка
 
 ```bash
 python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
+source venv/bin/activate
 pip install -e .
 ```
 
-## Обучение модели
-
-Перед первым запуском обучите модель на подготовленном датасете:
+## Подготовка данных и обучение
 
 ```bash
+# Сбор датасета: 50 Crossref + 50 КиберЛенинка (eLibrary опционально)
+python scripts/build_dataset.py
+
+# С eLibrary (нужны cookies и часто прокси)
+export $(cat .env | xargs)   # PROXY_USERNAME, PROXY_PASSWORD, PROXY_SERVER
+python scripts/build_dataset.py --refresh-elibrary-cookies
+python scripts/build_dataset.py --crossref 50 --cyberleninka 50 --elibrary 25
+
+# Обучение калиброванной модели
 python -m citation_matcher.train
 ```
 
 Модель сохраняется в `models/model.pkl`.
+
+## eLibrary.ru
+
+eLibrary требует cookies и часто блокирует запросы без прокси. Скопируйте `.env.example` в `.env` и задайте переменные прокси. Cookies сохраняются в `data/elibrary_cookies.json`.
+
+При captcha eLibrary пропускается, поиск продолжается по остальным базам.
 
 ## Использование
 
 ### Веб-интерфейс
 
 ```bash
+source venv/bin/activate
 uvicorn citation_matcher.app:app --reload
 ```
 
-Откройте [http://localhost:8000](http://localhost:8000) в браузере.
+Откройте [http://localhost:8000](http://localhost:8000).
 
-### Командная строка
+### CLI
 
 ```bash
-# Текстовый вывод
-python -m citation_matcher "Attention is all you need Vaswani 2017"
-
-# JSON-ответ
+python -m citation_matcher "ЭВОЛЮЦИЯ ТЕОРИИ ИНВЕСТИЦИЙ: ОТ ИСТОКОВ ДО СОВРЕМЕННОЙ ТЕОРИИ"
 python -m citation_matcher --json "Deep learning LeCun Nature 2015"
-```
-
-Пример ответа:
-
-```
-Best match (probability: 39.22%):
-LeCun Y., Bengio Y., Hinton G. Deep learning. Nature. 2015. Vol. 521 (7553). P. 436-444. DOI: 10.1038/nature14539
-
-DOI: 10.1038/nature14539
-
-Alternatives:
-  0.65% — Deep learning & convolutional networks
-  0.14% — Guest Editorial: Deep Learning
 ```
 
 ### Python API
@@ -61,57 +59,46 @@ Alternatives:
 from citation_matcher import match_citation
 
 result = match_citation("Deep learning LeCun Nature 2015")
-print(result.best_match["confidence"])           # 0.98 — относительная уверенность
-print(result.best_match["probability"])          # сырой ML-score (для отладки)
-print(result.best_match["formatted_citation"])   # LeCun Y. ...
-```
-
-### JSON API
-
-```bash
-curl -X POST http://localhost:8000/api/match \
-  -H "Content-Type: application/json" \
-  -d '{"query": "Deep learning LeCun Nature 2015"}'
+print(result.best_match["probability"])
+print(result.best_match["formatted_citation"])
 ```
 
 ## Как это работает
 
-1. **Поиск** — параллельные запросы в Crossref и OpenAlex; результаты объединяются, дубликаты по DOI удаляются.
-2. **Признаки** — для каждого кандидата: сходство заголовка (`token_sort_ratio`, `token_set_ratio`), сходство первого автора, score базы, ранг, разница лет.
-3. **Ранжирование** — `LogisticRegression.predict_proba` → вероятность совпадения.
-4. **Результат** — лучший кандидат с вероятностью и оформленной ссылкой.
+1. **Поиск** — параллельные запросы в Crossref, OpenAlex и КиберЛенинку (eLibrary отключён в runtime: 403/captcha без RU-прокси).
+2. **Признаки** — сходство заголовка, автора, ранг внутри базы, год, источник (one-hot).
+3. **Ранжирование** — калиброванная LogisticRegression (`CalibratedClassifierCV`).
+4. **Вероятность** — калиброванный `predict_proba`; для exact match по заголовку — boost.
+5. **Результат** — лучший кандидат с оформленной ссылкой.
 
-## Структура проекта
+## Структура
 
 ```
-src/citation_matcher/
-  search.py       — Crossref + OpenAlex API, объединение кандидатов
-  features.py     — признаки для ML
-  ranker.py       — загрузка модели и скоринг
-  format.py       — форматирование библиографической ссылки
-  matcher.py      — главная функция match_citation()
-  cli.py          — командная строка
-  app.py          — веб-интерфейс (FastAPI)
-  train.py        — обучение модели
-notebooks/          — исследование и сбор датасета
-data/               — датасет и метрики baseline
-models/             — обученная модель (model.pkl)
-tests/              — unit-тесты
+citation-matcher/
+├── src/citation_matcher/
+│   ├── config.py          — пути, константы, API URLs
+│   ├── search.py          — поиск по всем базам
+│   ├── elibrary.py        — клиент eLibrary.ru
+│   ├── matcher.py         — признаки, ранжирование, match_citation()
+│   ├── dataset.py         — сбор обучающего датасета
+│   ├── train.py           — обучение модели
+│   ├── app.py             — веб-интерфейс (FastAPI)
+│   ├── benchmark/         — офлайн-оценка и бенчмарки
+│   │   ├── evaluate.py
+│   │   ├── rankers.py
+│   │   └── sources.py
+│   └── util/
+│       ├── network_utils.py
+│       └── parsing_utils.py
+├── scripts/               — CLI для датасета и экспериментов (см. scripts/README.md)
+├── data/
+│   ├── seeds/             — seed-статьи (elibrary_data_fixed.csv)
+│   ├── processed/         — обучающий датасет
+│   └── reports/           — кэши бенчмарков
+├── models/                — model.pkl
+├── tests/fixtures/        — HTML-фикстуры для тестов
+└── docs/DESIGN_DOCUMENT.md
 ```
-
-## Качество
-
-Baseline Crossref (без ML) на синтетическом датасете из 480 запросов — `data/summary.csv`:
-
-| Тип ошибки              | Top-1 | Top-3 |
-|-------------------------|-------|-------|
-| Без ошибок              | 96.9% | 100%  |
-| Без автора              | 93.8% | 97.9% |
-| Без года                | 95.8% | 100%  |
-| Опечатка в заголовке    | 94.8% | 96.9% |
-| Пропущенное слово       | 95.8% | 97.9% |
-
-ML-модель (Accuracy на тесте: **99%**) переупорядочивает объединённых кандидатов из обеих баз.
 
 ## Тесты
 
@@ -119,7 +106,19 @@ ML-модель (Accuracy на тесте: **99%**) переупорядочив
 pytest
 ```
 
+## Бенчмарки
+
+```bash
+python scripts/benchmark_rankers.py -n 20          # Crossref vs CyberLeninka vs Matcher
+python scripts/compare_ranking.py                  # native vs ML по источникам
+python scripts/compare_sources.py --english 15 --russian 15
+```
+
+## Документация
+
+[docs/DESIGN_DOCUMENT.md](docs/DESIGN_DOCUMENT.md) — дизайн-документ проекта.
+
 ## Ограничения
 
-- Оптимальная работа — для статей с DOI в Crossref или OpenAlex.
-- Качество зависит от полноты запроса (заголовок, автор, год).
+- Качество зависит от полноты запроса и наличия статьи в базах.
+- OpenAlex участвует при inference; eLibrary доступен для датасета и бенчмарков (`sources=("...", "elibrary")`), но не в дефолтном `/match`.

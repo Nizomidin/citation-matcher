@@ -1,0 +1,9 @@
+Source,Type of Error,top1,top3,top10,count
+crossref,No author error,0.9375,0.9791666666666666,0.9791666666666666,48
+crossref,No errors,0.9583333333333334,1.0,1.0,48
+crossref,No year error,0.9583333333333334,1.0,1.0,48
+crossref,Title with dropped word error,0.9583333333333334,1.0,1.0,48
+crossref,Typo in title error,0.8958333333333334,0.9791666666666666,1.0,48
+cyberleninka,No errors,1.0,1.0,1.0,50
+cyberleninka,Title with dropped word error,1.0,1.0,1.0,50
+cyberleninka,Typo in title error,0.02,0.04,0.04,50

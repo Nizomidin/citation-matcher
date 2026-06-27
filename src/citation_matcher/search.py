@@ -1,208 +1,300 @@
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-import requests
+from citation_matcher.config import (
+    CROSSREF_API,
+    CYBERLENINKA_API,
+    DEFAULT_MULTI_SEARCH_SOURCES,
+    DEFAULT_ROWS,
+    OPENALEX_API,
+    USER_AGENT,
+)
+from citation_matcher.elibrary import (
+    elibrary_dataset_results,
+    elibrary_search,
+    get_articles_elibrary,
+)
+from citation_matcher.util.network_utils import request_json
+from citation_matcher.util.parsing_utils import (
+    _candidate_key,
+    _extract_year,
+    _parse_authors,
+    clean_html,
+)
 
-from citation_matcher.text import clean_html
+logger = logging.getLogger(__name__)
 
-USER_AGENT = "citation-matcher/0.1 (mailto:citation-matcher@example.com)"
+__all__ = [
+    "crossref_search",
+    "openalex_search",
+    "cyberleninka_search",
+    "elibrary_search",
+    "multi_search",
+    "get_articles_crossref",
+    "get_articles_cyberleninka",
+    "get_articles_elibrary",
+    "search_for_dataset",
+]
 
-CROSSREF_API = "https://api.crossref.org/works"
-OPENALEX_API = "https://api.openalex.org/works"
 
-
-def crossref_search(query: str, rows: int = 10) -> list[dict[str, Any]]:
-    """Search Crossref for bibliographic candidates."""
-    try:
-        response = requests.get(
-            CROSSREF_API,
-            params={"query.bibliographic": query, "rows": rows},
-            timeout=20,
-            headers={"User-Agent": USER_AGENT},
-        )
-    except requests.RequestException:
+def crossref_search(query: str, rows: int = DEFAULT_ROWS) -> list[dict[str, Any]]:
+    data = request_json(
+        "GET",
+        CROSSREF_API,
+        params={"query.bibliographic": query, "rows": rows},
+        headers={"User-Agent": USER_AGENT},
+    )
+    if not data:
         return []
 
-    if response.status_code != 200:
+    items = data.get("message", {}).get("items", [])[:rows]
+    return [
+        {**dict(item), "source_rank": rank, "rank": rank, "source": "crossref"}
+        for rank, item in enumerate(items, start=1)
+    ]
+
+
+def openalex_search(query: str, rows: int = DEFAULT_ROWS) -> list[dict[str, Any]]:
+    data = request_json(
+        "GET",
+        OPENALEX_API,
+        params={
+            "search": query,
+            "per-page": rows,
+            "select": "title,authorships,primary_location,publication_year,doi,relevance_score",
+        },
+        headers={"User-Agent": USER_AGENT},
+    )
+    if not data:
         return []
 
-    items = response.json().get("message", {}).get("items", [])
     candidates: list[dict[str, Any]] = []
-    for rank, item in enumerate(items, start=1):
-        item = dict(item)
-        item["rank"] = rank
-        item["source"] = "crossref"
+    for rank, work in enumerate((data.get("results") or [])[:rows], start=1):
+        authors: list[dict[str, str]] = []
+        for authorship in work.get("authorships") or []:
+            display = authorship.get("author", {}).get("display_name") or ""
+            parts = display.rsplit(" ", 1)
+            authors.append(
+                {
+                    "given": parts[0] if len(parts) > 1 else "",
+                    "family": parts[-1],
+                }
+            )
+
+        venue = (work.get("primary_location") or {}).get("source") or {}
+        journal = venue.get("display_name") or ""
+        year = work.get("publication_year")
+        doi = (work.get("doi") or "").replace("https://doi.org/", "")
+
+        item: dict[str, Any] = {
+            "title": [clean_html(work.get("title") or "")],
+            "author": authors,
+            "container-title": [journal] if journal else [],
+            "DOI": doi or None,
+            "score": float(work.get("relevance_score") or 0),
+            "source_rank": rank,
+            "rank": rank,
+            "source": "openalex",
+        }
+        if year:
+            item["issued"] = {"date-parts": [[year]]}
         candidates.append(item)
     return candidates
 
 
-def _openalex_to_crossref(work: dict[str, Any], rank: int) -> dict[str, Any]:
-    """Normalize an OpenAlex work to a Crossref-like structure."""
-    # title
-    title = clean_html(work.get("title") or "")
-
-    # authors
-    authors: list[dict[str, str]] = []
-    for authorship in work.get("authorships") or []:
-        display = authorship.get("author", {}).get("display_name") or ""
-        parts = display.rsplit(" ", 1)
-        family = parts[-1]
-        given = parts[0] if len(parts) > 1 else ""
-        authors.append({"given": given, "family": family})
-
-    # journal
-    venue = work.get("primary_location") or {}
-    source = venue.get("source") or {}
-    journal = source.get("display_name") or ""
-
-    # year
-    year = work.get("publication_year")
-
-    # doi
-    doi = (work.get("doi") or "").replace("https://doi.org/", "")
-
-    # crossref score proxy: relevance_score from OpenAlex
-    oa_score = float(work.get("relevance_score") or 0)
-
-    normalized: dict[str, Any] = {
-        "title": [title],
-        "author": authors,
-        "container-title": [journal] if journal else [],
-        "DOI": doi or None,
-        "score": oa_score,
-        "rank": rank,
-        "source": "openalex",
-    }
-    if year:
-        normalized["issued"] = {"date-parts": [[year]]}
-    return normalized
-
-
-def openalex_search(query: str, rows: int = 10) -> list[dict[str, Any]]:
-    """Search OpenAlex for bibliographic candidates."""
-    try:
-        response = requests.get(
-            OPENALEX_API,
-            params={
-                "search": query,
-                "per-page": rows,
-                "select": "title,authorships,primary_location,publication_year,doi,relevance_score",
-            },
-            timeout=20,
-            headers={"User-Agent": USER_AGENT},
-        )
-    except requests.RequestException:
+def cyberleninka_search(query: str, rows: int = DEFAULT_ROWS) -> list[dict[str, Any]]:
+    data = request_json(
+        "POST",
+        CYBERLENINKA_API,
+        json={"mode": "articles", "q": query, "size": rows, "from": 0},
+        headers={
+            "content-type": "application/json",
+            "origin": "https://cyberleninka.ru",
+            "referer": "https://cyberleninka.ru/",
+            "user-agent": USER_AGENT,
+        },
+    )
+    if not data:
         return []
 
-    if response.status_code != 200:
-        return []
-
-    results = response.json().get("results") or []
-    return [
-        _openalex_to_crossref(work, rank) for rank, work in enumerate(results, start=1)
-    ]
-
-
-def cyberleninka_search(query: str, rows: int = 10):
-    headers = {
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9,ru;q=0.8",
-        "content-type": "application/json",
-        "origin": "https://cyberleninka.ru",
-        "priority": "u=1, i",
-        "referer": "https://cyberleninka.ru/search?q=%D0%A1%D0%9E%D0%92%D0%95%D0%A0%D0%A8%D0%95%D0%9D%D0%A1%D0%A2%D0%92%D0%9E%D0%92%D0%90%D0%9D%D0%98%D0%95%20%D0%A1%D0%A2%D0%A0%D0%A3%D0%9A%D0%A2%D0%A3%D0%A0%D0%AB%20%D0%A1%D0%A3%D0%91%D0%AA%D0%95%D0%9A%D0%A2%D0%9E%D0%92%20%D0%9F%D0%9E%D0%A2%D0%A0%D0%95%D0%91%D0%98%D0%A2%D0%95%D0%9B%D0%AC%D0%A1%D0%9A%D0%9E%D0%93%D0%9E%20%D0%A0%D0%AB%D0%9D%D0%9A%D0%90%20%D0%9D%D0%90%20%D0%9E%D0%A1%D0%9D%D0%9E%D0%92%D0%95%20%D0%98%D0%A1%D0%9F%D0%9E%D0%9B%D0%AC%D0%97%D0%9E%D0%92%D0%90%D0%9D%D0%98%D0%AF%20%D0%A4%D0%98%D0%97%D0%98%D0%A7%D0%95%D0%A1%D0%9A%D0%98%D0%A5%20%D0%90%D0%9D%D0%90%D0%9B%D0%9E%D0%93%D0%98%D0%99&page=1",
-        "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"macOS"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-        # 'cookie': '_ga=GA1.2.763198204.1780901579; _gid=GA1.2.96971.1780901579; _ym_uid=1780901579460253252; _ym_d=1780901579; _ym_isad=2; adrcid=AumZitIzjeCSA6IBMqe3CXQ; acs_3=%7B%22hash%22%3A%221aa3f9523ee6c2690cb34fc702d4143056487c0d%22%2C%22nst%22%3A1780987988364%2C%22sl%22%3A%7B%22224%22%3A1780901588364%2C%221228%22%3A1780901588364%7D%7D; _gat=1; _gcl_au=1.2.391471826.1780952831; _ga_4GZ9YCR2VB=GS2.2.s1780952828$o2$g1$t1780952831$j57$l0$h0; adrdel=1780952831420',
-    }
-
-    json_data = {
-        "mode": "articles",
-        "q": query,
-        "size": 10,
-        "from": 0,
-    }
-
-    try:
-        response = requests.post(
-            "https://cyberleninka.ru/api/search", headers=headers, json=json_data
-        )
-    except requests.RequestException:
-        return []
-
-    if response.status_code != 200:
-        return []
-    articles = response.json().get("articles") or []
-    print(articles)
-    result: list[dict[str, Any]] = []
-    for rank, article in enumerate(articles[:rows], start=1):
+    candidates: list[dict[str, Any]] = []
+    for rank, article in enumerate((data.get("articles") or [])[:rows], start=1):
         year = article.get("year")
-        print(article.get("authors"))
-        normalized: dict[str, Any] = {
+        link = article.get("link")
+        item: dict[str, Any] = {
             "title": [clean_html(article.get("name"))],
             "container-title": [clean_html(article.get("journal"))]
             if article.get("journal")
             else [],
-            "author": {"given": article.get("authors").get(0), "family": ""},
+            "author": _parse_authors(article.get("authors")),
             "DOI": None,
-            "score": (100 / rows) * rank,
+            "link": link,
+            "score": float(rows - rank + 1),
+            "source_rank": rank,
             "rank": rank,
             "source": "cyberleninka",
         }
         if year:
-            normalized["year"] = year
-            normalized["issued"] = {"date-parts": [[int(year)]]}
-        result.append(normalized)
-    return result
+            item["year"] = year
+            item["issued"] = {"date-parts": [[int(year)]]}
+        candidates.append(item)
+    return candidates
 
 
-def multi_search(query: str, rows: int = 10) -> list[dict[str, Any]]:
-    """Search both Crossref and OpenAlex in parallel and merge candidates."""
+def multi_search(
+    query: str,
+    rows: int = DEFAULT_ROWS,
+    *,
+    sources: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    all_sources = {
+        "crossref": crossref_search,
+        "openalex": openalex_search,
+        "cyberleninka": cyberleninka_search,
+        "elibrary": elibrary_search,
+    }
+    if sources is None:
+        source_map = {
+            name: all_sources[name]
+            for name in DEFAULT_MULTI_SEARCH_SOURCES
+            if name in all_sources
+        }
+    else:
+        source_map = {name: all_sources[name] for name in sources if name in all_sources}
     results: dict[str, list[dict[str, Any]]] = {}
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=max(len(source_map), 1)) as pool:
         futures = {
-            pool.submit(crossref_search, query, rows): "crossref",
-            pool.submit(openalex_search, query, rows): "openalex",
-            pool.submit(cyberleninka_search, query, rows): "cyberleninka",
+            pool.submit(search_fn, query, rows): name
+            for name, search_fn in source_map.items()
         }
         for future in as_completed(futures):
             name = futures[future]
             try:
                 results[name] = future.result()
             except Exception:
+                logger.exception("%s search failed", name)
                 results[name] = []
 
-    crossref = results.get("crossref") or []
-    openalex = results.get("openalex") or []
-    cyberleninka = results.get("cyberleninka") or []
-    # deduplicate by DOI: prefer crossref entry when both have the same DOI
-    seen_dois: set[str] = set()
+    seen: set[str] = set()
     merged: list[dict[str, Any]] = []
+    for source in source_map:
+        for candidate in results.get(source) or []:
+            key = _candidate_key(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(candidate)
 
-    for candidate in crossref:
-        doi = (candidate.get("DOI") or "").lower()
-        if doi:
-            seen_dois.add(doi)
-        merged.append(candidate)
-
-    for candidate in openalex:
-        doi = (candidate.get("DOI") or "").lower()
-        if doi and doi in seen_dois:
-            continue
-        merged.append(candidate)
-
-    for candidate in cyberleninka:
-        merged.append(candidate)
-    # re-rank sequentially after merge
     for idx, candidate in enumerate(merged, start=1):
         candidate["rank"] = idx
-
     return merged
+
+
+def get_articles_crossref(count: int) -> list[dict[str, Any]]:
+    if count <= 0:
+        return []
+
+    data = request_json(
+        "GET",
+        CROSSREF_API,
+        params={
+            "filter": "type:journal-article,has-references:true",
+            "rows": count,
+            "select": "DOI,title,author,container-title,issued,published-print,published-online",
+        },
+        headers={"User-Agent": USER_AGENT},
+    )
+    if not data:
+        return []
+
+    cleaned: list[dict[str, Any]] = []
+    for item in data.get("message", {}).get("items", []):
+        title_list = item.get("title") or []
+        authors = item.get("author") or []
+        first = authors[0] if authors else None
+        first_name = (
+            f"{first.get('given', '')} {first.get('family', '')}".strip()
+            if isinstance(first, dict)
+            else str(first or "").strip()
+        )
+        year = _extract_year(item)
+        doi = item.get("DOI")
+        if not doi or not title_list or not first_name or not year:
+            continue
+        if title_list == ["In Response"]:
+            continue
+        cleaned.append(
+            {
+                "id": doi,
+                "source": "crossref",
+                "title": clean_html(title_list[0]),
+                "year": year,
+                "first_author": first_name,
+                "journal": clean_html((item.get("container-title") or [""])[0]),
+            }
+        )
+    return cleaned
+
+
+def get_articles_cyberleninka(count: int) -> list[dict[str, Any]]:
+    if count <= 0:
+        return []
+
+    data = request_json(
+        "POST",
+        CYBERLENINKA_API,
+        json={"mode": "articles", "q": "", "size": count, "from": 0},
+        headers={"User-Agent": USER_AGENT},
+    )
+    if not data:
+        return []
+
+    cleaned: list[dict[str, Any]] = []
+    for item in data.get("articles") or []:
+        authors = item.get("authors") or []
+        link = item.get("link")
+        title = item.get("name")
+        year = item.get("year")
+        if not link or not title or not authors or not year:
+            continue
+        cleaned.append(
+            {
+                "id": link,
+                "source": "cyberleninka",
+                "title": clean_html(title),
+                "year": year,
+                "first_author": authors[0],
+                "journal": clean_html(item.get("journal")),
+            }
+        )
+    return cleaned
+
+
+def search_for_dataset(
+    source: str, query: str, rows: int = DEFAULT_ROWS
+) -> list[dict[str, Any]]:
+    if source == "crossref":
+        data = request_json(
+            "GET",
+            CROSSREF_API,
+            params={"query.bibliographic": query, "rows": rows},
+            headers={"User-Agent": USER_AGENT},
+        )
+        return (data or {}).get("message", {}).get("items", [])
+    if source == "cyberleninka":
+        data = request_json(
+            "POST",
+            CYBERLENINKA_API,
+            json={"mode": "articles", "q": query, "size": rows, "from": 0},
+            headers={"User-Agent": USER_AGENT},
+        )
+        if not data or data.get("found", 0) == 0:
+            return []
+        return data.get("articles") or []
+    if source == "elibrary":
+        return elibrary_dataset_results(query, rows=rows)
+    raise ValueError(f"Unknown source: {source}")

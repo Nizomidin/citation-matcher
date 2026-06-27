@@ -6,3 +6,13 @@ __pycache__/
 dist/
 build/
 .DS_Store
+.env
+cookies.json
+data/elibrary_cookies.json
+qwe.py
+data.json
+Items.json
+merge.json
+log/
+*.html
+!tests/fixtures/response.html
